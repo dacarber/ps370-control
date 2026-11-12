@@ -13,7 +13,7 @@ PROJECT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 def hw_port(request):
     port = request.config.getoption("--port")
     if not port:
-        pytest.skip("no hardware port given (use --port /dev/ttyUSB0)")
+        pytest.skip("no hardware port given (use --port=/dev/ttyUSB0)")
     return port
 
 

@@ -108,7 +108,7 @@ safe to energise.
 Without either, the GUI tests are skipped (not failed). Each GUI test runs in its own process
 with a time limit, so a stuck window fails that test instead of freezing the run.
 
-You can also call pytest directly, e.g. `pytest tests/test_hardware.py --port /dev/ttyUSB0 -v`
+You can also call pytest directly, e.g. `pytest tests/test_hardware.py --port=/dev/ttyUSB0 -v` (use the `=`; with a space pytest mistakes the port for a test path)
 or `PS370_TEST_PORT=/dev/ttyUSB0 pytest -v`.
 
 ## 5. First real session (do this with the HV switch OFF and the output safe)

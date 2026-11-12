@@ -64,11 +64,12 @@ if [ -n "$PORT" ] && [ -z "$REHEARSE" ]; then
   [[ "$ans" =~ ^[Yy] ]] || { echo "Aborted."; exit 1; }
 fi
 
-ARGS=(-v -rs)
-[ -n "$PORT" ] && ARGS+=(--port "$PORT")
-[ -n "$HV" ] && ARGS+=("$HV")
+# Pass the port via environment variables, never as "--port /dev/ttyUSB0": pytest would
+# take /dev/ttyUSB0 for a test path, pick /dev as the project folder, and lose the options.
+export PS370_TEST_PORT="$PORT"
+if [ -n "$HV" ]; then export PS370_TEST_HV=1; else export PS370_TEST_HV=0; fi
 
-"${WRAP[@]}" "$PYTHON" -m pytest "${ARGS[@]}"
+"${WRAP[@]}" "$PYTHON" -m pytest -c pytest.ini --rootdir=. -v -rs
 rc=$?
 echo
 if [ $rc -eq 0 ]; then echo "ALL TESTS PASSED"; else echo "SOME TESTS FAILED (exit $rc). See the output above."; fi

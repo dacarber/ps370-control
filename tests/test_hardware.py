@@ -1,7 +1,7 @@
 """Tests against a REAL PS370. Skipped unless a port is given:
 
-    pytest tests/test_hardware.py --port /dev/ttyUSB0          # HV stays OFF
-    pytest tests/test_hardware.py --port /dev/ttyUSB0 --hv     # + low-voltage HV-on test
+    pytest tests/test_hardware.py --port=/dev/ttyUSB0          # HV stays OFF
+    pytest tests/test_hardware.py --port=/dev/ttyUSB0 --hv     # + low-voltage HV-on test
 
 Before running: HV output OFF, output cable safe/terminated. The tests only change
 VSET (with HV off) and put every setting back at the end. The --hv test turns the
