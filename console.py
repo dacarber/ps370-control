@@ -19,7 +19,15 @@ Commands are sent to the PS370 as typed (case-insensitive). Separate several wit
 Local commands: help, status (decoded *STB?), clear (clear this screen, GUI only)"""
 
 
-def execute_line(psu: PS370, line: str) -> list[str]:
+def execute_line(psu: PS370, line: str, source: str | None = None) -> list[str]:
+    """Run one console line (logged with ``source``, e.g. "console"); see _execute."""
+    if source:
+        with psu.log_as(source):
+            return _execute(psu, line)
+    return _execute(psu, line)
+
+
+def _execute(psu: PS370, line: str) -> list[str]:
     """Run one console line; return the lines of output to show.
 
     Instrument errors are returned as 'ERROR ...' lines rather than raised, so
@@ -33,6 +41,8 @@ def execute_line(psu: PS370, line: str) -> list[str]:
         return HELP.splitlines()
     if low == "status":
         st = psu.status()
+        if psu.logger:
+            psu._log("status (*STB?)", "REPLY", str(st["raw"]))
         on = [k for k in ("hvon", "stable", "ilim", "vtrip", "itrip") if st[k]]
         return [f"STB={st['raw']}  set: {', '.join(on) or 'none'}"]
 
@@ -42,9 +52,9 @@ def execute_line(psu: PS370, line: str) -> list[str]:
             continue
         try:
             if "?" in part:
-                out.append(psu.query(part))
+                out.append(psu.query(part, log=True))  # logged with its reply
             else:
-                psu.command(part)
+                psu.command(part)                      # logged OK / ERROR
                 out.append("OK")
         except PS370Error as e:
             out.append(f"ERROR {e.code}: {e}")
@@ -59,7 +69,11 @@ def run_shell(psu: PS370, input_fn=input, out=print) -> None:
         import readline  # noqa: F401  (gives arrow-key history where available)
     except ImportError:
         pass
-    out(f"Connected: {psu.idn()}")
+    idn = psu.idn()
+    out(f"Connected: {idn}")
+    if psu.logger:
+        psu.logger.event("shell started", detail=idn)
+        out(f"Logging commands to {psu.logger.log_dir}")
     out("Type 'help' for commands, 'quit' or Ctrl-D to exit.")
     while True:
         try:
@@ -69,5 +83,7 @@ def run_shell(psu: PS370, input_fn=input, out=print) -> None:
             break
         if line.strip().lower() in ("quit", "exit", "q"):
             break
+        if line.strip().lower() == "clear":
+            continue
         for r in execute_line(psu, line):
             out(r)

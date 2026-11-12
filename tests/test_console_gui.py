@@ -54,5 +54,9 @@ def test_gui_demo_runs(gui_scenario):
     gui_scenario("sim_demo")
 
 
-def test_gui_logs_csv(gui_scenario, tmp_path):
+def test_gui_extra_csv_copy(gui_scenario, tmp_path):
     gui_scenario("any_csv", "SIM", "--csv", str(tmp_path / "gui.csv"))
+
+
+def test_gui_data_logs(gui_scenario, tmp_path):
+    gui_scenario("sim_logs", log_dir=tmp_path / "logs")

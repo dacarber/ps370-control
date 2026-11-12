@@ -1,24 +1,29 @@
-"""Poll the PS370 and log output voltage, current and status to CSV."""
+"""Poll the PS370 and log output voltage, current and status to CSV.
+
+Every sample goes to the always-on data log (``psu.logger``, see datalog.py);
+``csv_path`` optionally writes an extra copy to a file of your choice.
+"""
 
 from __future__ import annotations
 
 import csv
 import os
 import time
-from datetime import datetime
 
+from datalog import READING_FIELDS, stamp
 from ps370 import PS370
 
-CSV_FIELDS = ["timestamp", "vout_V", "iout_A", "hv_on", "stable",
-              "vtrip", "itrip", "ilim", "stb_raw"]
+CSV_FIELDS = READING_FIELDS
 
 
 def take_sample(psu: PS370) -> dict:
+    ts, unix = stamp()  # time of the voltage reading; same clock as the commands log
     v = psu.read_voltage()
     i = psu.read_current()
     st = psu.status()  # clears latched trip bits, so they are captured here
     return {
-        "timestamp": datetime.now().isoformat(timespec="milliseconds"),
+        "timestamp": ts,
+        "unix_time": unix,
         "vout_V": v,
         "iout_A": i,
         "hv_on": int(st["hvon"]),
@@ -41,7 +46,7 @@ def format_sample(s: dict) -> str:
     if s["itrip"]:
         flags.append("I-TRIP!")
     hv = "ON " if s["hv_on"] else "off"
-    return (f"{s['timestamp']}  HV {hv}  V = {s['vout_V']:9.1f} V  "
+    return (f"{s['timestamp'][:23]}  HV {hv}  V = {s['vout_V']:9.1f} V  "
             f"I = {s['iout_A'] * 1e6:7.2f} uA  {' '.join(flags)}")
 
 
@@ -77,6 +82,8 @@ def monitor(psu: PS370, interval: float = 1.0, csv_path: str | None = None,
             else:
                 n += 1
                 out(format_sample(s))
+                if psu.logger:
+                    psu.logger.reading(s)
                 if writer:
                     writer.writerow(s)
                     fh.flush()

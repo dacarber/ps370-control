@@ -9,6 +9,10 @@ Panels: connection, live readout + status lights, settings, HV on/off,
 strip chart, CSV logging, and a console for typing raw instrument commands.
 All serial I/O runs in one background thread so the window never freezes.
 Esc switches the high voltage OFF from anywhere in the window.
+
+Every reading and every command (buttons, settings, console) is logged to
+logs/readings_<date>.csv and logs/commands_<date>.csv on one shared clock
+(see datalog.py). The "Logging" checkbox pauses/resumes it.
 """
 
 from __future__ import annotations
@@ -21,10 +25,10 @@ import threading
 import time
 import tkinter as tk
 from collections import deque
-from datetime import datetime
-from tkinter import filedialog, messagebox, ttk
+from tkinter import messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
 
+import datalog
 from console import execute_line
 from monitor import CSV_FIELDS, take_sample
 from ps370 import PS370
@@ -120,8 +124,9 @@ class App:
     OFF_BG = "#d9d9d9"
 
     def __init__(self, root: tk.Tk, port: str | None = None, interval: float = 1.0,
-                 csv_path: str | None = None):
+                 csv_path: str | None = None, logger: datalog.DataLogger | None = None):
         self.root = root
+        self.logger = logger  # always-on data log (None only with --no-log)
         self.events: queue.Queue = queue.Queue()
         self.worker: Worker | None = None
         self.v_hist: deque = deque(maxlen=HISTORY)
@@ -144,6 +149,10 @@ class App:
         self._after_ids: list[str] = []
         self._drain_id = root.after(50, self._drain)
 
+        self._show_log_state()
+        if self.logger:
+            self.logger.event("GUI started")
+            self.log(f"--- logging readings and commands to {self.logger.log_dir}", "info")
         if csv_path:
             self._open_csv(csv_path)
         if port:
@@ -227,8 +236,8 @@ class App:
         ttk.Label(opts, text="s").pack(side="left")
         self.interval_var.trace_add("write", lambda *a: self._interval_changed())
         self.log_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(opts, text="Log to CSV", variable=self.log_var,
-                        command=self._toggle_csv).pack(side="left", padx=(14, 3))
+        ttk.Checkbutton(opts, text="Logging", variable=self.log_var,
+                        command=self._toggle_logging).pack(side="left", padx=(14, 3))
         self.csv_label = tk.StringVar(value="")
         ttk.Label(opts, textvariable=self.csv_label, foreground="#555").pack(side="left")
 
@@ -300,6 +309,7 @@ class App:
         port = self.port_var.get().strip()
         try:
             psu = open_psu(port)
+            psu.logger = self.logger
         except Exception as e:
             messagebox.showerror("Connection failed", f"Could not open {port}:\n{e}")
             return
@@ -322,6 +332,8 @@ class App:
                     "No reply", f"{port} opened, but the PS370 did not answer *IDN?.\n\n{err}")
             else:
                 self.idn_var.set(idn)
+            if self.logger:
+                self.logger.event("connected", detail=f"{port}  {idn if idn else err}")
         self._submit(lambda p: p.idn(), done)
         self.refresh_settings()
 
@@ -334,6 +346,8 @@ class App:
         self.idn_var.set("Not connected")
         self.status_var.set("Disconnected")
         self.log("--- disconnected", "info")
+        if self.logger:
+            self.logger.event("disconnected")
 
     # --------------------------------------------------------------- actions
     def refresh_settings(self) -> None:
@@ -370,6 +384,8 @@ class App:
         msg = (f"Turn ON high voltage?\n\nVSET = {vset:.0f} V" if vset is not None
                else "Turn ON high voltage?")
         if confirm and not messagebox.askyesno("Confirm HV ON", msg, icon="warning"):
+            if self.logger:
+                self.logger.event("HV ON cancelled at confirmation")
             return
         self.log("> HV ON", "cmd")
         self._submit(lambda p: p.hv_on(), self._ok_or_err)
@@ -410,7 +426,7 @@ class App:
             for ln in lines:
                 self.log(ln, "err" if ln.startswith("ERROR") else None)
             self.refresh_settings()  # the command may have changed a setting
-        self._submit(lambda p: execute_line(p, line), done)
+        self._submit(lambda p: execute_line(p, line, source="console"), done)
 
     def _history(self, step: int) -> str:
         if not self.history:
@@ -422,35 +438,44 @@ class App:
         return "break"
 
     # --------------------------------------------------------------- logging
-    def _toggle_csv(self) -> None:
-        if self.log_var.get():
-            name = datetime.now().strftime("ps370_log_%Y%m%d_%H%M%S.csv")
-            path = filedialog.asksaveasfilename(
-                title="Log samples to…", initialfile=name, defaultextension=".csv",
-                filetypes=[("CSV", "*.csv")], confirmoverwrite=False)
-            if not path:
-                self.log_var.set(False)
-                return
-            self._open_csv(path)
+    def _show_log_state(self) -> None:
+        on = bool(self.logger and self.logger.enabled)
+        self.log_var.set(on)
+        if self.logger:
+            where = self.logger.log_dir.replace(os.path.expanduser("~"), "~", 1)
+            self.csv_label.set(where if on else f"paused ({where})")
         else:
-            self._close_csv()
+            self.csv_label.set("off")
+
+    def _toggle_logging(self) -> None:
+        """'Logging' checkbox: pause/resume the always-on readings + commands logs."""
+        if self.log_var.get():
+            if self.logger is None:
+                self.logger = datalog.DataLogger(source="gui")
+                if self.worker:
+                    self.worker.psu.logger = self.logger
+            self.logger.enabled = True
+            self.logger.event("logging resumed")
+            self.log(f"--- logging to {self.logger.log_dir}", "info")
+        elif self.logger:
+            self.logger.event("logging paused")
+            self.logger.enabled = False
+            self.log("--- logging paused", "info")
+        self._show_log_state()
 
     def _open_csv(self, path: str) -> None:
+        """Extra copy of the readings in a file of your choice (--csv)."""
         new = not os.path.exists(path) or os.path.getsize(path) == 0
         self.csv_fh = open(path, "a", newline="")
         self.csv_writer = csv.DictWriter(self.csv_fh, fieldnames=CSV_FIELDS)
         if new:
             self.csv_writer.writeheader()
-        self.log_var.set(True)
-        self.csv_label.set(os.path.basename(path))
-        self.log(f"--- logging to {path}", "info")
+        self.log(f"--- also copying readings to {path}", "info")
 
     def _close_csv(self) -> None:
         if self.csv_fh:
             self.csv_fh.close()
-            self.log("--- logging stopped", "info")
         self.csv_fh = self.csv_writer = None
-        self.csv_label.set("")
 
     # ------------------------------------------------------------ event loop
     def _drain(self) -> None:
@@ -481,8 +506,10 @@ class App:
         for key in ("vtrip", "itrip"):
             if s[key] and not self.trips[key]:
                 self.trips[key] = True
-                self.log(f"*** {'VOLTAGE' if key == 'vtrip' else 'CURRENT'} TRIP at "
-                         f"{s['timestamp']} ***", "err")
+                what = "VOLTAGE TRIP" if key == "vtrip" else "CURRENT TRIP"
+                self.log(f"*** {what} at {s['timestamp'][:23]} ***", "err")
+                if self.logger:
+                    self.logger.event(what, detail=f"seen in reading at {s['timestamp']}")
         states = {"hvon": s["hv_on"], "stable": s["stable"], "ilim": s["ilim"],
                   "vtrip": self.trips["vtrip"], "itrip": self.trips["itrip"]}
         for key, _, color in self.LIGHTS:
@@ -491,6 +518,8 @@ class App:
         self.v_hist.append(s["vout_V"])
         self.i_hist.append(s["iout_A"] * 1e6)
         self._draw_chart()
+        if self.logger:
+            self.logger.reading(s)
         if self.csv_writer:
             self.csv_writer.writerow(s)
             self.csv_fh.flush()
@@ -600,6 +629,9 @@ class App:
             self.worker.join(timeout=3)
             self.worker = None
         self._close_csv()
+        if self.logger:
+            self.logger.event("GUI closed")
+            self.logger.close()
         # Cancel pending callbacks, otherwise Tk reports them as errors after destroy().
         for aid in [self._drain_id, *self._after_ids]:
             try:
@@ -614,12 +646,16 @@ def main(argv=None) -> None:
     p.add_argument("--port", default=os.environ.get("PS370_PORT"),
                    help="serial port to connect at start-up, or SIM for the simulator")
     p.add_argument("--interval", type=float, default=1.0, help="seconds between readings")
-    p.add_argument("--csv", help="start logging to this CSV file")
+    p.add_argument("--csv", help="also copy readings to this CSV file")
+    p.add_argument("--log-dir", help="folder for the data logs "
+                   "(default: $PS370_LOG_DIR or logs/ next to this script)")
+    p.add_argument("--no-log", action="store_true", help="start with data logging off")
     p.add_argument("--demo", action="store_true",
                    help="play a scripted demo (only allowed with the simulator)")
     a = p.parse_args(argv)
     root = tk.Tk()
-    app = App(root, port=a.port, interval=a.interval, csv_path=a.csv)
+    app = App(root, port=a.port, interval=a.interval, csv_path=a.csv,
+              logger=datalog.from_args(a, source="gui"))
     if a.demo:
         # The demo turns HV on, so refuse to run it against real hardware.
         def check_and_start(tries=0):

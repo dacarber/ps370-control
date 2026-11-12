@@ -164,7 +164,7 @@ def test_monitor_writes_csv(psu, tmp_path, clock):
                 sleep=lambda s: None, out=lines.append)
     assert n == 3
     rows = list(csv.DictReader(path.open()))
-    assert list(rows[0].keys()) == CSV_FIELDS
+    assert list(rows[0].keys()) == CSV_FIELDS and "unix_time" in CSV_FIELDS
     assert len(rows) == 3
     assert float(rows[0]["vout_V"]) == pytest.approx(-1000, abs=1)
     assert rows[0]["hv_on"] == "1"

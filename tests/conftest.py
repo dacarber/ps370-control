@@ -17,10 +17,15 @@ def hw_port(request):
     return port
 
 
-def run_gui_scenario(name, port="SIM", *extra, timeout=90):
-    """Run tests/gui_scenarios.py <name> in a fresh process (one Tk window per process)."""
+def run_gui_scenario(name, port="SIM", *extra, timeout=90, log_dir=None):
+    """Run tests/gui_scenarios.py <name> in a fresh process (one Tk window per process).
+
+    The data logs go to ``log_dir`` (default: the per-test PS370_LOG_DIR temp folder).
+    """
     cmd = [sys.executable, "-m", "tests.gui_scenarios", name, "--port", port, *extra,
            "--timeout", str(timeout - 10)]
+    if log_dir:
+        cmd += ["--log-dir", str(log_dir)]
     try:
         r = subprocess.run(cmd, cwd=PROJECT, capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:

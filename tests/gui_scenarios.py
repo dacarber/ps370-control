@@ -1,7 +1,7 @@
 """GUI test scenarios. Each runs in its OWN process (one Tk window per process),
 launched by the pytest wrappers in test_console_gui.py / test_hardware.py:
 
-    python -m tests.gui_scenarios <scenario> [--port SIM|/dev/ttyUSB0] [--csv path]
+    python -m tests.gui_scenarios <scenario> [--port SIM|/dev/ttyUSB0] [--csv path] [--log-dir d]
 
 Exit codes: 0 pass, 1 fail (message on stderr), 77 no display available.
 """
@@ -9,6 +9,7 @@ Exit codes: 0 pass, 1 fail (message on stderr), 77 no display available.
 from __future__ import annotations
 
 import argparse
+import csv
 import faulthandler
 import sys
 import time
@@ -95,7 +96,85 @@ def any_csv(app, args):
     app._open_csv(args.csv)
     check(pump(app, lambda: open(args.csv).read().count("\n") >= 3, timeout=10),
           "CSV rows not written")
-    check(open(args.csv).readline().startswith("timestamp,vout_V"), "CSV header")
+    check(open(args.csv).readline().startswith("timestamp,unix_time,vout_V"), "CSV header")
+
+
+def read_logs(app):
+    """(commands rows, readings rows) from the GUI's data logs, all days."""
+    import glob
+    import os
+    d = app.logger.log_dir
+    rows = {}
+    for kind in ("commands", "readings"):
+        rows[kind] = []
+        for f in sorted(glob.glob(os.path.join(d, f"{kind}_*.csv"))):
+            rows[kind] += list(csv.DictReader(open(f)))
+    return rows["commands"], rows["readings"]
+
+
+def find(rows, **want):
+    for i, r in enumerate(rows):
+        if all(r[k] == v for k, v in want.items()):
+            return i, r
+    raise AssertionError(f"no command-log row matching {want}; rows: "
+                         + "; ".join(f"{r['source']}|{r['command']}|{r['status']}" for r in rows))
+
+
+def sim_logs(app, args):
+    """Commands and readings land in the two CSVs, in order, on one clock."""
+    wait_connected(app, ",SIM")
+    set_via_gui(app, "vset", "-2000")
+    check(pump(app, lambda: app.set_cur["vset"].get() == "-2000.0"), "VSET not applied")
+    send(app, "*IDN?")
+    check(pump(app, lambda: "SIM" in text(app).split("> *IDN?")[-1]), "no *IDN? reply")
+    send(app, "VSET 500")                     # raw: instrument rejects
+    check(pump(app, lambda: "ERROR 10" in text(app)), "VSET 500 not rejected")
+    set_via_gui(app, "vset", "1000")          # driver refuses
+    check(pump(app, lambda: "negative-only" in text(app)), "VSET 1000 not refused")
+    app.hv_on()
+    check(pump(app, lambda: app.vout_var.get().replace(",", "").startswith(("-2000", "-1999"))),
+          "VOUT did not reach -2000")
+    n = len(app.v_hist)
+    check(pump(app, lambda: len(app.v_hist) >= n + 3), "readings stopped")
+    set_via_gui(app, "itrp", "10")            # 20 uA load > 10 uA -> current trip
+    check(pump(app, lambda: "CURRENT TRIP" in text(app), timeout=5), "no trip")
+    pump(app, lambda: False, timeout=0.6)     # let a couple more readings arrive
+
+    cmds, reads = read_logs(app)
+    check(len(reads) >= 5, f"only {len(reads)} readings logged")
+    check(reads[0].keys() >= {"timestamp", "unix_time", "vout_V", "iout_A"}, "readings columns")
+    order = [
+        find(cmds, source="gui", command="connected", status="EVENT"),
+        find(cmds, source="gui", command="VSET -2000", status="OK"),
+        find(cmds, source="console", command="*IDN?", status="REPLY"),
+        find(cmds, source="console", command="VSET 500", status="ERROR"),
+        find(cmds, source="gui", command="VSET 1000", status="REFUSED"),
+        find(cmds, source="gui", command="HVON", status="OK"),
+        find(cmds, source="gui", command="ITRP 1e-05", status="OK"),
+        find(cmds, source="gui", command="CURRENT TRIP", status="EVENT"),
+    ]
+    idx = [i for i, _ in order]
+    check(idx == sorted(idx), f"command log out of order: {idx}")
+    check(order[2][1]["response"].endswith(",SIM"), "IDN reply not logged")
+    check(order[3][1]["response"].startswith("10 "), "error code not logged")
+    times = [float(r["unix_time"]) for r in cmds]
+    check(times == sorted(times), "command times not increasing")
+    # line up: readings before HVON are off, readings after it are on
+    t_on = float(order[5][1]["unix_time"])
+    before = [r for r in reads if float(r["unix_time"]) < t_on]
+    after = [r for r in reads if float(r["unix_time"]) > t_on + 0.5]
+    check(before and all(r["hv_on"] == "0" for r in before), "readings before HVON show HV on")
+    check(after and any(r["hv_on"] == "1" for r in after), "no HV-on readings after HVON")
+    check(any(r["itrip"] == "1" for r in reads), "trip bit not in readings log")
+    # pausing stops both files
+    app.log_var.set(False)
+    app._toggle_logging()
+    nc, nr = len(read_logs(app)[0]), len(read_logs(app)[1])
+    send(app, "VSET?")
+    pump(app, lambda: False, timeout=0.8)
+    c2, r2 = read_logs(app)
+    check(len(c2) == nc and len(r2) == nr, "logging did not pause")
+    check(c2[-1]["command"] == "logging paused", "pause event missing")
 
 
 # ---- hardware scenarios (HV stays OFF) --------------------------------------------------
@@ -124,10 +203,16 @@ def hw_setting_and_console(app, args):
     check(pump(app, lambda: text(app) != before), "no reply to VOUT?; IOUT?")
     app.hv_off()
     check(pump(app, lambda: text(app).rstrip().endswith("OK")), "HV OFF not acknowledged")
+    cmds, reads = read_logs(app)
+    find(cmds, source="console", command="*IDN?", status="REPLY")
+    find(cmds, source="console", command="VSET 500", status="ERROR")
+    find(cmds, source="gui", command="VSET 100", status="REFUSED")
+    find(cmds, source="gui", command="HVOF", status="OK")
+    check(len(reads) >= 1, "no readings logged")
 
 
 SCENARIOS = {f.__name__: f for f in
-             (sim_end_to_end, sim_demo, any_csv, hw_connect, hw_setting_and_console)}
+             (sim_end_to_end, sim_demo, any_csv, sim_logs, hw_connect, hw_setting_and_console)}
 
 
 def main(argv=None) -> int:
@@ -135,6 +220,7 @@ def main(argv=None) -> int:
     p.add_argument("scenario", choices=SCENARIOS)
     p.add_argument("--port", default="SIM")
     p.add_argument("--csv")
+    p.add_argument("--log-dir", help="data log folder (default: $PS370_LOG_DIR / logs/)")
     p.add_argument("--timeout", type=float, default=60)
     args = p.parse_args(argv)
     faulthandler.dump_traceback_later(args.timeout, exit=True)  # never hang silently
@@ -147,6 +233,7 @@ def main(argv=None) -> int:
         return NO_DISPLAY
     root.withdraw()
 
+    import datalog
     import ps370_gui
     mb = ps370_gui.messagebox
     dialogs = []
@@ -155,7 +242,8 @@ def main(argv=None) -> int:
     for name in ("showerror", "showwarning", "showinfo"):
         setattr(mb, name, lambda *a, _n=name, **k: dialogs.append((_n, a)))
 
-    app = ps370_gui.App(root, port=args.port, interval=0.25)
+    app = ps370_gui.App(root, port=args.port, interval=0.25,
+                        logger=datalog.DataLogger(args.log_dir, source="gui"))
     app.dialogs = dialogs
     rc = 0
     try:

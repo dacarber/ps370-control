@@ -12,6 +12,9 @@ from __future__ import annotations
 
 import threading
 import time
+from contextlib import contextmanager
+
+from datalog import ERROR, OK, REFUSED, REPLY
 
 try:
     import serial  # pyserial
@@ -96,7 +99,8 @@ class PS370:
     ``reset_input_buffer`` / ``close`` methods (the tests use a simulator).
     """
 
-    def __init__(self, port: str = "/dev/ttyUSB0", timeout: float = 1.0, ser=None):
+    def __init__(self, port: str = "/dev/ttyUSB0", timeout: float = 1.0, ser=None,
+                 logger=None):
         if ser is None:
             if serial is None:
                 raise ImportError("pyserial is required: pip install pyserial")
@@ -113,6 +117,8 @@ class PS370:
             )
         self.ser = ser
         self._lock = threading.RLock()
+        self.logger = logger      # datalog.DataLogger or None
+        self.log_source = None    # overrides logger.source while set (see log_as)
 
     # ---- context manager -----------------------------------------------------
     def close(self) -> None:
@@ -123,6 +129,29 @@ class PS370:
 
     def __exit__(self, *exc):
         self.close()
+
+    # ---- command log -----------------------------------------------------------
+    def _log(self, cmd: str, status: str, response: str = "") -> None:
+        if self.logger:
+            self.logger.command(cmd, status, response, source=self.log_source)
+
+    @contextmanager
+    def log_as(self, source: str):
+        """Tag commands logged inside this block with ``source`` (e.g. "console")."""
+        with self._lock:
+            old, self.log_source = self.log_source, source
+            try:
+                yield self
+            finally:
+                self.log_source = old
+
+    def _checked(self, desc: str, validate):
+        """Run a driver-side safety check; log REFUSED if it rejects the request."""
+        try:
+            return validate()
+        except ValueError as e:
+            self._log(desc, REFUSED, str(e))
+            raise
 
     # ---- low level I/O -------------------------------------------------------
     def write(self, cmd: str) -> None:
@@ -145,16 +174,24 @@ class PS370:
             buf += b
         return buf.decode("ascii", errors="replace").strip()
 
-    def query(self, cmd: str) -> str:
-        """Send a query and return the reply line."""
+    def query(self, cmd: str, log: bool = False) -> str:
+        """Send a query and return the reply line.
+
+        ``log=True`` records it in the commands log (used for typed queries; routine
+        polling such as VOUT?/IOUT?/*STB? is not logged).
+        """
         with self._lock:
             self.ser.reset_input_buffer()
             self.write(cmd)
             reply = self._readline()
         if not reply:
+            if log:
+                self._log(cmd, ERROR, "no reply (timeout)")
             raise TimeoutError(
                 f"No reply to '{cmd}'. Check cable, port name, and that the supply is on."
             )
+        if log:
+            self._log(cmd, REPLY, reply)
         return reply
 
     def query_float(self, cmd: str) -> float:
@@ -174,8 +211,16 @@ class PS370:
     def command(self, cmd: str) -> None:
         """Send a set command, then confirm the instrument accepted it."""
         with self._lock:
-            self.write(cmd)
-            self.check_error(cmd)
+            try:
+                self.write(cmd)
+                self.check_error(cmd)
+            except PS370Error as e:
+                self._log(cmd, ERROR, f"{e.code} {LERR_CODES.get(e.code, 'Unknown error')}")
+                raise
+            except TimeoutError as e:
+                self._log(cmd, ERROR, f"no reply while checking: {e}")
+                raise
+            self._log(cmd, OK)
 
     # ---- identification / housekeeping ---------------------------------------
     def idn(self) -> str:
@@ -218,27 +263,30 @@ class PS370:
 
     # ---- settings ------------------------------------------------------------
     def set_voltage(self, volts: float) -> None:
-        v = self._validate_voltage(volts, self.voltage_limit())
+        v = self._checked(f"VSET {volts:g}",
+                          lambda: self._validate_voltage(volts, self.voltage_limit()))
         self.command(f"VSET {v:.6g}")
 
     def voltage_setpoint(self) -> float:
         return self.query_float("VSET?")
 
     def set_voltage_limit(self, volts: float) -> None:
-        v = self._validate_voltage(volts, None)
+        v = self._checked(f"VLIM {volts:g}", lambda: self._validate_voltage(volts, None))
         self.command(f"VLIM {v:.6g}")
 
     def voltage_limit(self) -> float:
         return self.query_float("VLIM?")
 
     def set_current_limit(self, amps: float) -> None:
-        self.command(f"ILIM {self._validate_current(amps, 'ILIM'):.6g}")
+        a = self._checked(f"ILIM {amps:g}", lambda: self._validate_current(amps, "ILIM"))
+        self.command(f"ILIM {a:.6g}")
 
     def current_limit(self) -> float:
         return self.query_float("ILIM?")
 
     def set_current_trip(self, amps: float) -> None:
-        self.command(f"ITRP {self._validate_current(amps, 'ITRP'):.6g}")
+        a = self._checked(f"ITRP {amps:g}", lambda: self._validate_current(amps, "ITRP"))
+        self.command(f"ITRP {a:.6g}")
 
     def current_trip(self) -> float:
         return self.query_float("ITRP?")
@@ -288,7 +336,8 @@ class PS370:
         """
         if rate <= 0 or step <= 0:
             raise ValueError("rate and step must be positive")
-        self._validate_voltage(target, self.voltage_limit())  # fail before moving
+        self._checked(f"ramp to {target:g} V",  # fail before moving
+                      lambda: self._validate_voltage(target, self.voltage_limit()))
         v = self.voltage_setpoint()
         dt = step / rate
         while abs(target - v) > 1e-9:

@@ -6,10 +6,11 @@ plus a simulator so you can test everything on your laptop first.
 | File | What it is |
 |---|---|
 | `ps370.py` | Driver class `PS370` (settings, HV on/off, readback, status, error checking, ramp) |
-| `ps370_gui.py` | **GUI**: live readout, status lights, settings, HV on/off, chart, CSV logging, command console |
+| `ps370_gui.py` | **GUI**: live readout, status lights, settings, HV on/off, chart, command console |
 | `ps370_cli.py` | Command-line tool (incl. `shell`, an interactive command prompt) |
 | `console.py` | Raw-command execution shared by the GUI console and `shell` |
-| `monitor.py` | Polling loop → console + CSV |
+| `monitor.py` | Polling loop → console + readings log |
+| `datalog.py` | Always-on CSV logs of readings and commands (see §7) |
 | `sim/ps370_sim.py` | Simulated PS370 (virtual serial port or in-process `FakeSerial`) |
 | `tests/` | pytest suites: driver/CLI, console + GUI (simulator), and `test_hardware.py` (real PS370) |
 | `run_pi_tests.sh` | One-command test runner for the Pi (simulator, rehearsal, real hardware) |
@@ -95,7 +96,7 @@ What the real-hardware tests (step 3) check, all with HV off:
 identity; readings near 0 V / 0 µA; settings in range; VSET write/readback (−100 V); that the
 **instrument itself** rejects `VSET 500` and unknown commands; that the driver refuses positive
 voltages. The GUI then connects to the real port and checks readings, settings, the console,
-HV OFF and CSV logging. If the front-panel HV switch is OFF, it also checks that HVON is refused.
+HV OFF, and that commands and readings reach the data logs. If the front-panel HV switch is OFF, it also checks that HVON is refused.
 The tests stop if HV is on when they start. Every setting is restored at the end.
 
 Step 4 (`--hv`) sets VLIM −500 V and ITRP 50 µA, turns the output on at −200 V
@@ -124,14 +125,14 @@ or `PS370_TEST_PORT=/dev/ttyUSB0 pytest -v`.
 ```
 
 When the load and cabling are safe, turn the front-panel switch on and repeat
-`on`, then `monitor --interval 1 --csv hv_log.csv`. Ctrl-C stops monitoring. Add
+`on`, then `monitor --interval 1`. Ctrl-C stops monitoring. Add
 `--off-on-exit` if HV should drop when the logger stops. `off` turns the output off.
 
 ## 6. GUI and command console
 
 ```bash
 python3 ps370_gui.py                        # choose the port from the drop-down, press Connect
-python3 ps370_gui.py --port /dev/ttyUSB0 --interval 1 --csv hv_log.csv
+python3 ps370_gui.py --port /dev/ttyUSB0 --interval 1
 ```
 
 * **Output:** large voltage and current readouts, plus status lights: HV ON, STABLE, I-LIMIT, V-TRIP and I-TRIP.
@@ -140,7 +141,8 @@ python3 ps370_gui.py --port /dev/ttyUSB0 --interval 1 --csv hv_log.csv
   The current value next to each field is read back from the supply.
 * **HV ON…** asks for confirmation and shows VSET. **HV OFF** or **Esc** (from anywhere in the window) switches it off.
   If you close the window with HV on, it asks whether to switch it off first.
-* **History chart** of the last 600 samples. **Log to CSV** writes the same columns as `monitor`.
+* **History chart** of the last 600 samples.
+* **Logging** (on by default) records every reading and command; see §7. Untick it to pause logging.
 * **Command console:** type any command from the manual (`*IDN?`, `VSET -500`, `VOUT?; IOUT?`, `TCLR`, …),
   plus `help`, `status` and `clear`. ↑/↓ recall earlier commands. Note that the console sends commands
   exactly as typed, so only the instrument's own checks apply there.
@@ -159,7 +161,60 @@ Run it on the Pi's own desktop, over VNC (`sudo raspi-config` → Interface → 
 `ssh -X pi@<pi-host>` (needs XQuartz on the Mac). Only one program can use the serial port at a time,
 so close the GUI before running the CLI or the logger service.
 
-## 7. Using it from your own Python
+## 7. Data logs: readings and commands on one clock
+
+Logging is always on. The GUI, the CLI (`monitor`, `status`, `set-*`, `on`/`off`, `ramp`) and the `shell`
+all write to the same two files per day:
+
+```
+logs/readings_2026-11-12.csv   every sample: V, I, status bits
+logs/commands_2026-11-12.csv   every deliberate action, with its result
+```
+
+| readings column | meaning |
+|---|---|
+| `timestamp` | local time with UTC offset, ms, e.g. `2026-11-12T14:33:56.404-07:00` |
+| `unix_time` | the same moment in seconds since 1970 (UTC). **Use this to line files up.** |
+| `vout_V`, `iout_A` | measured output (V is negative, I in amps) |
+| `hv_on`, `stable`, `vtrip`, `itrip`, `ilim`, `stb_raw` | status bits from `*STB?` (trip and limit bits are latched, so even a brief trip shows up) |
+
+| commands column | meaning |
+|---|---|
+| `timestamp`, `unix_time` | as above, from the same clock |
+| `source` | `gui` (buttons/settings), `console` (typed in the GUI), `cli`, `shell` |
+| `command` | what was sent, e.g. `VSET -2000`, `HVON`, `*IDN?`, or an event name |
+| `status` | `OK` accepted · `REPLY` query answered · `ERROR` rejected by the PS370 · `REFUSED` blocked by the driver's safety check, never sent · `EVENT` connected/disconnected, trip seen, logging paused/resumed |
+| `response` | the reply, the error code and text, or the refusal reason |
+
+Routine polling (`VOUT?`, `IOUT?`, `*STB?`) goes only to the readings file, so the commands
+file holds just what someone did. Rows are written immediately, so a crash or power cut loses
+nothing. New files start at midnight.
+
+* Folder: `--log-dir DIR` on `ps370_gui.py` / `ps370_cli.py`, or `export PS370_LOG_DIR=DIR`;
+  default `logs/` next to the scripts. It's in `.gitignore`, so data never ends up on GitHub.
+* `--no-log` turns logging off (the GUI can still turn it on from the checkbox).
+* `--csv FILE` (GUI and `monitor`) still writes an extra copy of the readings to a file you name.
+
+**Lining them up.** In Excel, open both files, sort each by `unix_time` and read across. In Python,
+`merge_asof` attaches to each command the reading taken just before it, or just after it:
+
+```python
+import glob
+import pandas as pd
+
+load = lambda kind: pd.concat(pd.read_csv(f) for f in sorted(glob.glob(f"logs/{kind}_*.csv")))
+cmds, reads = load("commands").sort_values("unix_time"), load("readings").sort_values("unix_time")
+
+state_before = pd.merge_asof(cmds, reads, on="unix_time", direction="backward", suffixes=("", "_reading"))
+state_after  = pd.merge_asof(cmds, reads, on="unix_time", direction="forward",  suffixes=("", "_reading"))
+print(state_after[["timestamp", "command", "status", "vout_V", "iout_A", "hv_on"]])
+```
+
+To compare with another instrument, convert its timestamps to unix seconds and merge the same way.
+The Pi's clock comes from the network (NTP), so check `timedatectl` shows "System clock
+synchronized: yes" if you need to match data from another computer.
+
+## 8. Using it from your own Python
 
 ```python
 from ps370 import PS370
@@ -171,10 +226,23 @@ with PS370("/dev/ttyUSB0") as psu:
     print(psu.read_voltage(), psu.read_current(), psu.status())
 ```
 
+To log your own script's commands and readings into the same files:
+
+```python
+from datalog import DataLogger
+from monitor import take_sample
+
+log = DataLogger(source="script")            # logs/ by default
+with PS370("/dev/ttyUSB0", logger=log) as psu:
+    psu.set_voltage(-5000)                   # -> commands log (OK / ERROR / REFUSED)
+    log.reading(take_sample(psu))            # -> readings log
+    log.event("started run 42")              # your own markers
+```
+
 Every set command is followed by `*ESR?` (and `LERR?` when needed), so a value the
 instrument rejects raises `PS370Error` with the manual's error text.
 
-## 8. Optional: run the logger as a service
+## 9. Optional: run the logger as a service
 
 `/etc/systemd/system/ps370-monitor.service`:
 
@@ -186,7 +254,7 @@ After=dev-ttyUSB0.device
 [Service]
 User=pi
 WorkingDirectory=/home/pi/ps370
-ExecStart=/usr/bin/python3 ps370_cli.py --port /dev/ttyUSB0 monitor --interval 5 --csv /home/pi/hv_log.csv
+ExecStart=/usr/bin/python3 ps370_cli.py --port /dev/ttyUSB0 monitor --interval 5
 Restart=on-failure
 
 [Install]
